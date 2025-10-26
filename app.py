@@ -300,7 +300,7 @@ def analyze_image(pil_image: Image.Image,
                   open_class: str,
                   sbw: float,
                   sbh: float,
-                  bright_rescue_q: float = 0.90):
+                  bright_rescue_q: float = 0.70):
     """
     Return:
       raw_open_pct,
