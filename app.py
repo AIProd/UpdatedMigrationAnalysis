@@ -1,5 +1,4 @@
 import re
-from io import BytesIO
 from typing import List, Tuple, Dict
 
 import numpy as np
@@ -34,22 +33,20 @@ def build_wound_mask_from_t0(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Identify the wound region at time 0.
-
     Steps:
-        1. Compute Sobel gradient.
-        2. Treat the lowest Nth percentile of gradient magnitude as "smooth gap".
-        3. Morphological cleanup.
-        4. Keep the single largest connected component as wound.
+        1. Sobel gradient
+        2. Lowest percentile = smooth gap
+        3. Morph cleanup
+        4. Keep largest connected component
     Returns:
         wound_mask (bool HxW)
-        grad0      (float HxW) Sobel gradient map at t0
+        grad0 (float HxW)
     """
     grad0 = sobel(gray_blur)
 
     thr = np.percentile(grad0, wound_low_grad_percentile)
     wound_candidate = grad0 < thr
 
-    # cleanup / smoothing
     wound_candidate = morphology.remove_small_objects(
         wound_candidate, min_size=min_wound_size
     )
@@ -60,12 +57,11 @@ def build_wound_mask_from_t0(
         wound_candidate, morphology.disk(morph_kernel_radius)
     )
 
-    # largest component only
     labeled, _ = measure.label(wound_candidate, return_num=True)
     sizes = np.bincount(labeled.ravel())
     if sizes.size == 0:
         raise ValueError("No wound-like region detected in first frame.")
-    sizes[0] = 0  # ignore background label 0
+    sizes[0] = 0  # ignore background
     biggest_label = sizes.argmax()
     wound_mask = labeled == biggest_label
 
@@ -77,8 +73,8 @@ def make_band_mask(
     band_thickness_px: int,
 ) -> np.ndarray:
     """
-    Build a 'reference band': a ring just outside the wound.
-    Used as the confluent monolayer reference for normalization.
+    Build a ring just outside the wound. Used as the confluent monolayer
+    reference for normalization.
     """
     dilated = morphology.binary_dilation(
         wound_mask, morphology.disk(band_thickness_px)
@@ -95,14 +91,12 @@ def parse_hours_from_name(name: str) -> float:
         - "24H", "72 H" -> hours
     Fallback: 0
     """
-    # pattern like "01d00h"
     m = re.search(r'(\d+)\s*[dD]\s*(\d+)\s*[hH]', name)
     if m:
         days = float(m.group(1))
         hours = float(m.group(2))
         return days * 24.0 + hours
 
-    # pattern like "24H" / "72 H"
     m = re.search(r'(\d+)\s*[hH]', name)
     if m:
         return float(m.group(1))
@@ -118,9 +112,9 @@ def overlay_debug_rgb(
     alpha_cells: float = 0.4,
 ) -> Image.Image:
     """
-    Build an RGB overlay for QC:
+    RGB overlay for QC:
       - Wound region from t0 tinted blue
-      - Cells detected inside the wound at this timepoint tinted green
+      - Cells inside wound tinted green
     """
     base = np.array(img_pil.convert("RGB")).astype(np.float32)
     out = base.copy()
@@ -143,11 +137,10 @@ def overlay_debug_rgb(
 def _cell_threshold(grad: np.ndarray, band_mask: np.ndarray, cell_percentile: float):
     """
     Adaptive texture threshold:
-    Take a given percentile of Sobel gradient values in the reference band.
-    Lower percentile -> more sensitive to faint / transparent cells.
+    Take a percentile of Sobel gradient in the band region.
+    Lower percentile -> more sensitive to faint cells.
     """
     if band_mask.sum() == 0:
-        # Fallback: use global grad distribution if band is empty for some reason
         return np.percentile(grad, cell_percentile)
     return np.percentile(grad[band_mask], cell_percentile)
 
@@ -160,17 +153,17 @@ def analyze_timepoint(
     cell_percentile: float,
 ) -> Dict[str, float]:
     """
-    Compute timepoint migration metrics.
+    Compute timepoint metrics.
 
     Wound Confluence (%):
-        Fraction of original wound area now classified as cells * 100.
+        Fraction of the original wound area now classified as cells * 100.
 
     Relative Wound Density (%):
         RWD(t) = 100 * ( w(t) - w(0) ) / ( c(t) - w(0) )
         where
             w(t) = wound cell fraction at time t
             c(t) = band cell fraction at time t
-            w(0) = baseline wound fraction at t=0
+            w(0) = wound cell fraction at t=0
     """
     grad = sobel(gray_blur)
     thr_cell = _cell_threshold(grad, band_mask, cell_percentile)
@@ -178,22 +171,14 @@ def analyze_timepoint(
     wound_cells_mask = np.logical_and(wound_mask, grad > thr_cell)
     band_cells_mask = np.logical_and(band_mask, grad > thr_cell)
 
-    # coverage fractions
     wound_area = wound_mask.sum()
-    band_area = band_mask.sum()
+    band_area = band_mask.sum() if band_mask.sum() > 0 else 1
 
-    if wound_area == 0:
-        raise ValueError("Wound mask area is zero.")
-    if band_area == 0:
-        # fallback to avoid div-by-zero in normalization
-        band_area = 1
-
-    w_frac = wound_cells_mask.sum() / wound_area
+    w_frac = wound_cells_mask.sum() / max(wound_area, 1)
     c_frac = band_cells_mask.sum() / band_area
 
     wound_confluence_pct = 100.0 * w_frac
 
-    # RWD normalization
     denom = (c_frac - w0_frac)
     if abs(denom) < 1e-9:
         rwd_pct = 0.0
@@ -221,16 +206,8 @@ def run_full_analysis(
     cell_percentile: float,
 ) -> Tuple[pd.DataFrame, List[Image.Image]]:
     """
-    Full analysis pipeline for a single well / condition:
-        1. Sort frames by parsed time.
-        2. Build wound mask from earliest frame.
-        3. Compute metrics (Wound Confluence, Relative Wound Density) at each timepoint.
-        4. Generate QC overlays (blue wound, green migrated cells).
-    Returns:
-        df_metrics: table of results
-        overlays:   list of QC overlay images, aligned with df_metrics rows
+    Full analysis for one well / condition.
     """
-    # sort frames by inferred hours
     hours_list = [parse_hours_from_name(n) for n in names]
     order = np.argsort(hours_list)
 
@@ -238,10 +215,8 @@ def run_full_analysis(
     names_sorted = [names[i] for i in order]
     hours_sorted = [hours_list[i] for i in order]
 
-    # grayscale + blur
     gray_series = [to_gray(im, gaussian_sigma) for im in images_sorted]
 
-    # wound mask from earliest frame (t0)
     wound_mask, _grad0 = build_wound_mask_from_t0(
         gray_series[0],
         wound_low_grad_percentile,
@@ -249,16 +224,13 @@ def run_full_analysis(
         min_wound_size,
     )
 
-    # reference band
     band_mask = make_band_mask(wound_mask, band_thickness_px)
 
-    # baseline wound fraction at t=0
     grad_first = sobel(gray_series[0])
     thr_cell_first = _cell_threshold(grad_first, band_mask, cell_percentile)
     wound_cells_first = np.logical_and(wound_mask, grad_first > thr_cell_first)
     w0_frac = wound_cells_first.sum() / max(wound_mask.sum(), 1)
 
-    # loop over all timepoints
     rows = []
     overlays = []
     for img_pil, gray_img, hr, nm in zip(images_sorted, gray_series, hours_sorted, names_sorted):
@@ -277,7 +249,6 @@ def run_full_analysis(
             "Relative Wound Density (%)": metrics["relative_wound_density_pct"],
         })
 
-        # overlay for QC
         grad_now = sobel(gray_img)
         thr_now = _cell_threshold(grad_now, band_mask, cell_percentile)
         wound_cells_now = np.logical_and(wound_mask, grad_now > thr_now)
@@ -297,11 +268,17 @@ def plot_metric(
     values: np.ndarray,
     ylabel: str,
     title: str,
+    scale: float,
 ):
     """
     Small line+marker plot for a single metric.
+    scale controls figure size.
     """
-    fig, ax = plt.subplots(figsize=(4, 3), dpi=120)
+    # base size ~ (4,3); multiply by scale
+    fig_w = 4 * scale
+    fig_h = 3 * scale
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=120)
     ax.plot(hours, values, marker="o", linewidth=2)
     ax.set_xlabel("Hours")
     ax.set_ylabel(ylabel)
@@ -312,9 +289,6 @@ def plot_metric(
 
 
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    """
-    DataFrame -> CSV bytes for download.
-    """
     return df.to_csv(index=False).encode("utf-8")
 
 
@@ -339,10 +313,10 @@ with st.form("analysis_form"):
         accept_multiple_files=True,
     )
 
-    st.markdown("### Advanced settings (optional)")
+    st.markdown("### Analysis settings (optional)")
     st.caption(
-        "These parameters control wound detection and cell detection. "
-        "Defaults usually work. Adjust only if the wound mask or cell detection looks off."
+        "Tweak only if the wound mask or cell detection looks off. "
+        "Defaults usually work."
     )
 
     col1, col2, col3 = st.columns(3)
@@ -354,7 +328,7 @@ with st.form("analysis_form"):
             max_value=5.0,
             value=1.0,
             step=0.1,
-            help="Pre-smoothing before edge detection. Higher smooths noise but can soften wound edges.",
+            help="Pre-smoothing before edge detection. Higher values reduce noise but can soften wound edges.",
         )
         wound_low_grad_percentile = st.slider(
             "Wound smoothness percentile",
@@ -363,7 +337,7 @@ with st.form("analysis_form"):
             value=30,
             step=1,
             help="Lower = narrower wound mask; higher = wider wound mask. "
-                 "This percentile of lowest Sobel gradient is treated as wound.",
+                 "Pixels with Sobel gradient below this percentile are considered wound.",
         )
 
     with col2:
@@ -373,8 +347,7 @@ with st.form("analysis_form"):
             max_value=30,
             value=10,
             step=1,
-            help="Radius used for morphological open/close. "
-                 "Larger values produce a smoother, more continuous wound band.",
+            help="Radius for morphological open/close. Larger = smoother wound band.",
         )
         band_thickness_px = st.slider(
             "Reference band thickness (px)",
@@ -382,7 +355,7 @@ with st.form("analysis_form"):
             max_value=200,
             value=50,
             step=5,
-            help="Thickness of the ring outside the wound used as the 'healthy monolayer' reference.",
+            help="Thickness of the ring outside the wound used as the reference monolayer.",
         )
 
     with col3:
@@ -392,8 +365,7 @@ with st.form("analysis_form"):
             max_value=200000,
             value=500,
             step=100,
-            help="Ignore wound candidates smaller than this. "
-                 "Prevents tiny specks from being mis-identified as the wound.",
+            help="Ignore wound candidates smaller than this area.",
         )
         cell_percentile = st.slider(
             "Cell texture percentile",
@@ -401,8 +373,29 @@ with st.form("analysis_form"):
             max_value=50,
             value=10,
             step=1,
-            help="Lower = more sensitive. "
-                 "At lower values, faint/transparent cells are still counted as cells.",
+            help="Lower = more sensitive to faint/transparent cells. "
+                 "Higher = stricter.",
+        )
+
+    st.markdown("### Display settings")
+    disp_col1, disp_col2 = st.columns(2)
+    with disp_col1:
+        plot_scale = st.slider(
+            "Plot scale",
+            min_value=0.5,
+            max_value=1.5,
+            value=0.8,
+            step=0.1,
+            help="Controls plot size. Lower = smaller plots.",
+        )
+    with disp_col2:
+        overlay_cols = st.slider(
+            "Overlay columns",
+            min_value=2,
+            max_value=4,
+            value=3,
+            step=1,
+            help="How many overlay previews per row.",
         )
 
     submitted = st.form_submit_button("Analyze")
@@ -411,7 +404,6 @@ if submitted:
     if not uploaded_files:
         st.warning("Please upload at least one image series.")
     else:
-        # Load images
         imgs = [Image.open(f).convert("RGB") for f in uploaded_files]
         names = [f.name for f in uploaded_files]
 
@@ -429,9 +421,6 @@ if submitted:
         except Exception as e:
             st.error(f"Analysis failed: {e}")
         else:
-            # ------------------------
-            # Metrics table + download
-            # ------------------------
             st.header("Metrics")
 
             styled = df_metrics.style.format({
@@ -449,44 +438,45 @@ if submitted:
                 mime="text/csv",
             )
 
-            # ------------------------
-            # Plots (smaller figs)
-            # ------------------------
             st.header("Time-Series Plots")
 
             hours_arr = df_metrics["Hours"].to_numpy(dtype=float)
 
             conf_arr = df_metrics["Wound Confluence (%)"].to_numpy(dtype=float)
-            fig_conf = plot_metric(
-                hours_arr,
-                conf_arr,
-                ylabel="Wound Confluence (%)",
-                title="Wound Confluence vs Time",
-            )
-            st.pyplot(fig_conf, clear_figure=True)
-
             rwd_arr = df_metrics["Relative Wound Density (%)"].to_numpy(dtype=float)
-            fig_rwd = plot_metric(
-                hours_arr,
-                rwd_arr,
-                ylabel="Relative Wound Density (%)",
-                title="Relative Wound Density vs Time",
-            )
-            st.pyplot(fig_rwd, clear_figure=True)
 
-            # ------------------------
-            # Overlays (smaller grid)
-            # ------------------------
+            # render plots side by side, both using the chosen plot_scale
+            pcol1, pcol2 = st.columns(2)
+            with pcol1:
+                fig_conf = plot_metric(
+                    hours_arr,
+                    conf_arr,
+                    ylabel="Wound Confluence (%)",
+                    title="Wound Confluence vs Time",
+                    scale=plot_scale,
+                )
+                st.pyplot(fig_conf, clear_figure=True)
+
+            with pcol2:
+                fig_rwd = plot_metric(
+                    hours_arr,
+                    rwd_arr,
+                    ylabel="Relative Wound Density (%)",
+                    title="Relative Wound Density vs Time",
+                    scale=plot_scale,
+                )
+                st.pyplot(fig_rwd, clear_figure=True)
+
             st.header("Overlay QC")
             st.caption(
                 "Blue: wound region defined at first timepoint.  "
                 "Green: detected cells inside that wound region at each timepoint."
             )
 
-            cols = st.columns(3)
+            # dynamic overlay grid based on slider
+            cols = st.columns(overlay_cols)
             for i, (row, overlay_img) in enumerate(zip(df_metrics.itertuples(index=False), overlays)):
-                col = cols[i % 3]
+                col = cols[i % overlay_cols]
                 with col:
                     st.caption(f"{row.Image}  ({row.Hours:.2f} h)")
-                    # use_container_width=True keeps the image nicely scaled in the column
                     st.image(overlay_img, use_container_width=True)
