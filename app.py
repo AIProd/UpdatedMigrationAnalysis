@@ -1,370 +1,266 @@
-import io
-import os
-from typing import List, Tuple
-
+import re
 import numpy as np
 import pandas as pd
-from PIL import Image, ImageDraw, ImageFont
+from typing import List, Tuple, Dict
 
+from PIL import Image, ImageOps
 import streamlit as st
 import matplotlib.pyplot as plt
 
-from skimage import exposure
-from skimage.color import rgb2gray
-from skimage.filters import threshold_otsu, gaussian
-from skimage.morphology import (
-    remove_small_objects,
-    binary_opening,
-    binary_closing,
-    binary_dilation,
-    disk,
-    label,
-)
+from skimage.filters import gaussian, sobel
+from skimage import morphology, measure
+
+# ----------------------------- CONFIG ---------------------------------
+GAUSSIAN_SIGMA = 1            # blur to denoise before gradients
+WOUND_LOW_GRAD_PERCENTILE = 30  # % of lowest gradient values to call "wound-like"
+MORPH_KERNEL_RADIUS = 10      # smooth wound edges
+MIN_WOUND_SIZE = 500          # drop tiny specks
+BAND_THICKNESS_PX = 50        # how far outside wound to sample monolayer
+CELL_PERCENTILE = 10          # how generous we are detecting cells (lower = more sensitive)
+
+# ----------------------------- HELPERS --------------------------------
 
 
-# ----------------------------- PAGE CONFIG -----------------------------
-st.set_page_config(page_title="Incucyte-style Migration Analysis", layout="wide")
-
-# You can edit this if you know the capture time (in hours) for each image you upload.
-# The assumption here is files[0] = time 0h, files[1] = 12h, etc.
-DEFAULT_TIMEPOINTS_HOURS = [0, 12, 24, 36, 48]
-
-
-# ----------------------------- IMAGE / MASK UTILS -----------------------------
-def load_image_as_array(uploaded_file) -> np.ndarray:
-    """Load uploaded image -> float grayscale [0..1]."""
-    img = Image.open(uploaded_file).convert("RGB")
-    gray = rgb2gray(np.array(img))  # 0..1 float
-    return gray
+def to_gray(img_pil: Image.Image) -> np.ndarray:
+    """PIL -> grayscale float [0..1] -> Gaussian blur."""
+    gray = np.array(ImageOps.grayscale(img_pil)).astype(np.float32)
+    blur = gaussian(gray, sigma=GAUSSIAN_SIGMA)
+    return blur  # float64 after gaussian
 
 
-def enhance_contrast(gray: np.ndarray) -> np.ndarray:
+def build_wound_mask_from_t0(gray_blur: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Make faint / lighter cells more visible.
-    Steps:
-    1. Adaptive histogram equalization (CLAHE via equalize_adapthist)
-    2. Gentle gaussian blur to reduce noise
-    Result stays 0..1 float.
+    Find the wound at t0 using texture: wound = large smooth low-gradient band.
+    Returns:
+        wound_mask (bool HxW)
+        grad0 (float HxW) Sobel gradient image for t0
     """
-    # CLAHE: clip_limit small so we don't over-amplify noise
-    eq = exposure.equalize_adapthist(gray, clip_limit=0.03)
-    smooth = gaussian(eq, sigma=1)
-    return smooth
+    grad0 = sobel(gray_blur)
+
+    # Low gradient = smooth gap. Pick the lowest ~30% gradient pixels as wound candidates.
+    thr = np.percentile(grad0, WOUND_LOW_GRAD_PERCENTILE)
+    wound_cand = grad0 < thr
+
+    # Morphological cleanup
+    wound_cand = morphology.remove_small_objects(wound_cand, min_size=MIN_WOUND_SIZE)
+    wound_cand = morphology.binary_closing(wound_cand, morphology.disk(MORPH_KERNEL_RADIUS))
+    wound_cand = morphology.binary_opening(wound_cand, morphology.disk(MORPH_KERNEL_RADIUS))
+
+    # Keep only the largest connected component (the main wound band)
+    labeled, _ = measure.label(wound_cand, return_num=True)
+    sizes = np.bincount(labeled.ravel())
+    sizes[0] = 0  # ignore background
+    biggest_label = sizes.argmax()
+    wound_mask = labeled == biggest_label
+
+    return wound_mask, grad0
 
 
-def segment_cells(enhanced_gray: np.ndarray,
-                  min_cell_area: int = 30,
-                  thresh_relax: float = 0.9) -> np.ndarray:
+def make_band_mask(wound_mask: np.ndarray, thickness_px: int = BAND_THICKNESS_PX) -> np.ndarray:
     """
-    Convert enhanced grayscale image -> binary mask of 'cells present'.
-
-    - We assume cells are BRIGHTER than background.
-    - Otsu gives a threshold; we relax it downward (multiply by thresh_relax < 1)
-      so that even faint bright cells above background are counted.
-    - Morphological open/close and small-object removal to clean noise.
+    Get a ring of 'monolayer reference' around the wound by dilating and subtracting.
+    This approximates the intact cell lawn on both sides.
     """
-    otsu_val = threshold_otsu(enhanced_gray)
-    relaxed = otsu_val * thresh_relax  # <-- more inclusive for faint cells
-
-    raw_mask = enhanced_gray > relaxed
-
-    # clean up mask
-    opened = binary_opening(raw_mask, disk(2))
-    closed = binary_closing(opened, disk(2))
-
-    cleaned = remove_small_objects(closed, min_size=min_cell_area)
-
-    return cleaned.astype(bool)
+    dilated = morphology.binary_dilation(wound_mask, morphology.disk(thickness_px))
+    band_mask = np.logical_and(dilated, ~wound_mask)
+    return band_mask
 
 
-def get_primary_wound_roi(cell_mask_t0: np.ndarray,
-                          min_wound_area_px: int = 5000) -> np.ndarray:
+def analyze_timepoint(
+    gray_blur: np.ndarray,
+    wound_mask: np.ndarray,
+    band_mask: np.ndarray,
+    baseline_w_frac: float,
+    cell_percentile: int = CELL_PERCENTILE,
+) -> Dict[str, float]:
     """
-    At time 0, wound = the big empty gap (no cells).
-    Strategy:
-      - Invert the cell mask -> "empty regions"
-      - Label connected components
-      - Pick the largest component above min_wound_area_px
-      - That becomes the canonical wound ROI for ALL timepoints
+    Compute Wound Confluence (%) and Relative Wound Density (%) for ONE timepoint.
+    - baseline_w_frac is w(0): wound cell fraction at t0
     """
-    empty_regions = ~cell_mask_t0
+    grad = sobel(gray_blur)
 
-    lbl = label(empty_regions)
-    if lbl.max() == 0:
-        # no connected components found, fallback to entire image = wound (shouldn't happen in real scratch assays)
-        return np.ones_like(cell_mask_t0, dtype=bool)
+    # Adaptive threshold for "cells": look at texture strength in the monolayer band.
+    thr_cell = np.percentile(grad[band_mask], cell_percentile)
 
-    wound_roi = np.zeros_like(cell_mask_t0, dtype=bool)
+    wound_cells_mask = np.logical_and(wound_mask, grad > thr_cell)
+    band_cells_mask = np.logical_and(band_mask, grad > thr_cell)
 
-    # choose largest component that is big enough
-    max_area = 0
-    max_region_id = None
-    for region_id in range(1, lbl.max() + 1):
-        region_mask = lbl == region_id
-        area = np.sum(region_mask)
-        if area > max_area and area >= min_wound_area_px:
-            max_area = area
-            max_region_id = region_id
+    w_frac = wound_cells_mask.sum() / wound_mask.sum()          # wound "cell coverage"
+    c_frac = band_cells_mask.sum() / band_mask.sum()            # monolayer "cell coverage"
+    w0 = baseline_w_frac
 
-    if max_region_id is None:
-        # fallback: just take the largest component anyway
-        for region_id in range(1, lbl.max() + 1):
-            region_mask = lbl == region_id
-            area = np.sum(region_mask)
-            if area > max_area:
-                max_area = area
-                max_region_id = region_id
+    # IncuCyte-style outputs
+    wound_confluence_pct = 100.0 * w_frac
+    # avoid /0, clip to 0..100 range for sanity
+    rwd_pct = 100.0 * (w_frac - w0) / (c_frac - w0 + 1e-9)
+    rwd_pct = float(np.clip(rwd_pct, 0, 100))
 
-    wound_roi[lbl == max_region_id] = True
-    return wound_roi
+    return {
+        "wound_confluence_pct": float(wound_confluence_pct),
+        "relative_wound_density_pct": float(rwd_pct),
+        "w_frac": float(w_frac),
+        "c_frac": float(c_frac),
+        "thr_cell": float(thr_cell),
+    }
 
 
-def get_border_roi(wound_roi: np.ndarray,
-                   border_px: int = 30) -> np.ndarray:
+def parse_hours_from_name(name: str) -> float:
     """
-    Relative Wound Density needs:
-       - wound region
-       - bordering monolayer region (reference density)
-    We'll get a "ring" around wound by dilating and subtracting.
-
-    border_px controls how thick that ring is.
+    Try to grab time info from filename.
+    We'll look for patterns like '00d00h00m', '01d00h00m', '24 H', '48H', '72 H', etc.
+    Returns hours as float. If nothing found, returns 0.
     """
-    dilated = binary_dilation(wound_roi, disk(border_px))
-    ring = np.logical_and(dilated, ~wound_roi)
-    return ring
+    # 1) try 'XdYYh' style (01d00h00m)
+    m = re.search(r'(\d+)\s*[dD]\s*(\d+)\s*[hH]', name)
+    if m:
+        days = float(m.group(1))
+        hours = float(m.group(2))
+        return days * 24.0 + hours
+
+    # 2) try explicit hours like '24H' or '72 H'
+    m = re.search(r'(\d+)\s*[hH]', name)
+    if m:
+        return float(m.group(1))
+
+    # fallback
+    return 0.0
 
 
-def measure_metrics(cell_mask: np.ndarray,
-                    wound_roi: np.ndarray,
-                    border_roi: np.ndarray) -> Tuple[float, float]:
+def overlay_debug_rgb(
+    img_pil: Image.Image,
+    wound_mask: np.ndarray,
+    wound_cells_mask: np.ndarray,
+    alpha_wound: float = 0.4,
+    alpha_cells: float = 0.4,
+) -> Image.Image:
     """
-    Compute:
-      - Wound Confluence (%)
-        = (% of wound ROI area now occupied by cells)
-        = 100 * (#cell_pixels_in_wound / wound_area)
-
-      - Relative Wound Density (%)
-        = density_wound / density_border * 100
-        where density = (#cell_pixels / area)
+    Make an RGB overlay:
+      - wound region tinted blue
+      - wound cells tinted green
+    Just for QC in Streamlit.
     """
-    wound_area = np.sum(wound_roi)
-    border_area = np.sum(border_roi)
+    base = np.array(img_pil.convert("RGB")).astype(np.float32)
+    out = base.copy()
 
-    cell_in_wound = np.sum(np.logical_and(cell_mask, wound_roi))
-    cell_in_border = np.sum(np.logical_and(cell_mask, border_roi))
+    # blue = wound area
+    blue = np.array([0, 0, 255], dtype=np.float32)
+    out[wound_mask] = (1 - alpha_wound) * out[wound_mask] + alpha_wound * blue
 
-    # avoid divide-by-zero
-    wound_confluence_pct = 0.0
-    rel_wound_density_pct = 0.0
+    # green = cells that have migrated into wound
+    green = np.array([0, 255, 0], dtype=np.float32)
+    out[wound_cells_mask] = (1 - alpha_cells) * out[wound_cells_mask] + alpha_cells * green
 
-    if wound_area > 0:
-        wound_confluence_pct = 100.0 * (cell_in_wound / wound_area)
-
-    wound_density = (cell_in_wound / wound_area) if wound_area > 0 else 0.0
-    border_density = (cell_in_border / border_area) if border_area > 0 else 1e-9
-
-    rel_wound_density_pct = 100.0 * (wound_density / border_density)
-
-    return wound_confluence_pct, rel_wound_density_pct
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
 
 
-def overlay_debug(rgb_img: np.ndarray,
-                  wound_roi: np.ndarray,
-                  border_roi: np.ndarray,
-                  cell_mask: np.ndarray) -> np.ndarray:
+def run_full_analysis(images: List[Image.Image], names: List[str]) -> Tuple[pd.DataFrame, List[Image.Image]]:
     """
-    Make a quick QC overlay:
-      - wound ROI tinted red
-      - border ROI tinted yellow
-      - detected cells tinted green
-    Output is uint8 RGB for preview.
+    Core driver:
+    1. sort images by time
+    2. build wound model from t0
+    3. compute metrics for each time
+    4. build QC overlays
     """
-    base = rgb_img.copy().astype(np.float32)
+    # sort by extracted hours
+    order = np.argsort([parse_hours_from_name(n) for n in names])
+    images_sorted = [images[i] for i in order]
+    names_sorted = [names[i] for i in order]
+    hours_sorted = [parse_hours_from_name(n) for n in names_sorted]
 
-    # green for cells
-    cell_overlay = np.stack([np.zeros_like(cell_mask),
-                             cell_mask.astype(float),
-                             np.zeros_like(cell_mask)], axis=-1)
+    # preprocess
+    grays = [to_gray(im) for im in images_sorted]
 
-    # red for wound
-    wound_overlay = np.stack([wound_roi.astype(float),
-                              np.zeros_like(wound_roi),
-                              np.zeros_like(wound_roi)], axis=-1)
+    # wound mask from first (earliest) frame
+    wound_mask, grad0 = build_wound_mask_from_t0(grays[0])
+    band_mask = make_band_mask(wound_mask, BAND_THICKNESS_PX)
 
-    # yellow for border (red+green)
-    border_overlay = np.stack([border_roi.astype(float),
-                               border_roi.astype(float),
-                               np.zeros_like(border_roi)], axis=-1)
+    # baseline wound coverage fraction at t0 (w0)
+    grad_first = sobel(grays[0])
+    thr_cell_first = np.percentile(grad_first[band_mask], CELL_PERCENTILE)
+    wound_cells_first = np.logical_and(wound_mask, grad_first > thr_cell_first)
+    w0_frac = wound_cells_first.sum() / wound_mask.sum()
 
-    # combine overlays
-    combined = base / 255.0
-    combined = np.clip(
-        combined * 0.6 + 0.4 * (cell_overlay + wound_overlay + border_overlay),
-        0, 1
-    )
-    return (combined * 255).astype(np.uint8)
+    # loop all timepoints
+    rows = []
+    debug_overlays = []
+    for img_pil, gray_img, hr, nm in zip(images_sorted, grays, hours_sorted, names_sorted):
+        metrics = analyze_timepoint(
+            gray_img,
+            wound_mask,
+            band_mask,
+            baseline_w_frac=w0_frac,
+            cell_percentile=CELL_PERCENTILE,
+        )
+
+        # Save table row
+        rows.append({
+            "Image": nm,
+            "Hours": hr,
+            "Wound Confluence (%)": metrics["wound_confluence_pct"],
+            "Relative Wound Density (%)": metrics["relative_wound_density_pct"],
+        })
+
+        # make overlay for QC
+        grad_now = sobel(gray_img)
+        thr_now = np.percentile(grad_now[band_mask], CELL_PERCENTILE)
+        wound_cells_now = np.logical_and(wound_mask, grad_now > thr_now)
+        overlay_img = overlay_debug_rgb(img_pil, wound_mask, wound_cells_now)
+        debug_overlays.append(overlay_img)
+
+    df = pd.DataFrame(rows).sort_values("Hours").reset_index(drop=True)
+    return df, debug_overlays
 
 
-# ----------------------------- STREAMLIT APP LOGIC -----------------------------
-st.title("Incucyte-style Wound Healing / Migration Analysis")
+# ----------------------------- STREAMLIT UI ----------------------------
 
-st.markdown(
-    """
-This app:
-1. Segments bright cells (more sensitive to faint cells).
-2. Locks the wound region from **time 0h** and reuses it.
-3. Measures:
-   - **Wound Confluence (%)** = % of wound that's filled with cells.
-   - **Relative Wound Density (%)** = cell density in wound vs surrounding monolayer.
-4. Outputs a results table like Incucyte.
+st.set_page_config(page_title="IncuCyte-style Migration Analysis", layout="wide")
 
-**Instructions**
-- Upload images from a *single well* across time.
-- Order doesn't matter; we'll sort by filename.
-- First image after sort = Time 0h (baseline wound mask).
-"""
+st.title("IncuCyte-style Wound Healing Analysis")
+st.caption(
+    "We lock the wound at t=0, detect invading cells over time, and report "
+    "Wound Confluence (%) and Relative Wound Density (%) similar to IncuCyte."
 )
 
 uploaded_files = st.file_uploader(
-    "Upload time-series brightfield images (same well across time)",
-    type=["png", "jpg", "jpeg", "tif", "tiff", "bmp"],
+    "Upload images for ONE well / condition (0h, 24h, 48h, 72h...). "
+    "Use the same magnification.",
+    type=["tif", "tiff", "png", "jpg", "jpeg"],
     accept_multiple_files=True,
 )
 
-custom_times = st.text_input(
-    "Optional: comma-separated timepoints in hours (matches sorted file order). "
-    "Leave blank to use default [0,12,24,36,48].",
-    value=",".join(map(str, DEFAULT_TIMEPOINTS_HOURS)),
-)
+show_debug = st.checkbox("Show debug overlays (wound in blue, invading cells in green)", value=False)
 
-run_btn = st.button("Run Analysis")
+if uploaded_files:
+    # Read images
+    imgs = [Image.open(f).convert("RGB") for f in uploaded_files]
+    names = [f.name for f in uploaded_files]
 
+    # Run analysis
+    df_metrics, overlays = run_full_analysis(imgs, names)
 
-if run_btn and uploaded_files:
-    # Sort files by filename for reproducible order
-    uploaded_files_sorted = sorted(uploaded_files, key=lambda f: f.name)
+    st.subheader("Results Table")
+    st.dataframe(df_metrics.style.format({
+        "Wound Confluence (%)": "{:.2f}",
+        "Relative Wound Density (%)": "{:.2f}",
+        "Hours": "{:.2f}",
+    }))
 
-    # Parse timepoints
-    try:
-        timepoints_hours = [
-            float(x.strip()) for x in custom_times.split(",")
-        ]
-    except Exception:
-        timepoints_hours = DEFAULT_TIMEPOINTS_HOURS[:]
-
-    # If user didn't provide enough timepoints, extend or trim
-    if len(timepoints_hours) < len(uploaded_files_sorted):
-        # extend by repeating last delta
-        if len(timepoints_hours) >= 2:
-            last_delta = timepoints_hours[-1] - timepoints_hours[-2]
-        else:
-            last_delta = 12.0
-        while len(timepoints_hours) < len(uploaded_files_sorted):
-            timepoints_hours.append(timepoints_hours[-1] + last_delta)
-    elif len(timepoints_hours) > len(uploaded_files_sorted):
-        timepoints_hours = timepoints_hours[:len(uploaded_files_sorted)]
-
-    st.subheader("Step 1. Build wound ROI from T0")
-
-    # --- T0 processing ---
-    base_file = uploaded_files_sorted[0]
-    base_gray = load_image_as_array(base_file)
-    base_enhanced = enhance_contrast(base_gray)
-    base_cell_mask = segment_cells(base_enhanced)
-
-    wound_roi = get_primary_wound_roi(base_cell_mask)
-    border_roi = get_border_roi(wound_roi, border_px=30)  # tunable ring size
-
-    # QC preview for T0
-    base_rgb = np.array(Image.open(base_file).convert("RGB"))
-    preview_t0 = overlay_debug(base_rgb, wound_roi, border_roi, base_cell_mask)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.image(base_rgb, caption=f"T0 Raw ({base_file.name})", use_column_width=True)
-    with col2:
-        st.image(preview_t0, caption="T0 QC Overlay (red=wound, yellow=border, green=cells)", use_column_width=True)
+    if show_debug:
+        st.subheader("QC Overlays")
+        cols = st.columns(2)
+        for i, (nm, ov) in enumerate(zip(df_metrics["Image"], overlays)):
+            with cols[i % 2]:
+                st.text(nm)
+                st.image(ov, use_column_width=True)
 
     st.markdown(
         """
-        - **wound ROI (red)** is fixed and will be reused for all later timepoints  
-        - **border ring (yellow)** is used to estimate background monolayer density  
+        **Notes / knobs you can tune on top of the script constants:**
+        - `CELL_PERCENTILE` ↓ (e.g. 8 instead of 10) will classify even fainter cells as 'present', increasing
+          Wound Confluence and RWD numbers.
+        - `BAND_THICKNESS_PX`: if your wound is huge or tiny, change how thick the monolayer reference band is.
+        - `WOUND_LOW_GRAD_PERCENTILE`: if the wound detection breaks, nudge this (20–40).
         """
     )
-
-    # --- Loop through all timepoints ---
-    records = []
-    qc_overlays = []
-
-    for img_file, t_hr in zip(uploaded_files_sorted, timepoints_hours):
-        gray = load_image_as_array(img_file)
-        enh = enhance_contrast(gray)
-        cell_mask = segment_cells(enhanced_gray=enh)
-
-        wound_confluence_pct, rel_wound_density_pct = measure_metrics(
-            cell_mask=cell_mask,
-            wound_roi=wound_roi,
-            border_roi=border_roi,
-        )
-
-        records.append(
-            {
-                "filename": img_file.name,
-                "time_h": t_hr,
-                "wound_confluence_pct": wound_confluence_pct,
-                "relative_wound_density_pct": rel_wound_density_pct,
-            }
-        )
-
-        # build QC overlay for this frame
-        rgb_img = np.array(Image.open(img_file).convert("RGB"))
-        ov = overlay_debug(rgb_img, wound_roi, border_roi, cell_mask)
-        qc_overlays.append((t_hr, img_file.name, ov))
-
-    # Results table
-    df_results = pd.DataFrame(records).sort_values("time_h").reset_index(drop=True)
-
-    st.subheader("Step 2. Quantitative Results")
-    st.write(df_results)
-
-    # Download as CSV
-    csv_bytes = df_results.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Download results CSV",
-        data=csv_bytes,
-        file_name="incucyte_style_metrics.csv",
-        mime="text/csv",
-    )
-
-    # Plot curves like Incucyte kinetics
-    st.subheader("Step 3. Kinetics Plots")
-
-    fig1, ax1 = plt.subplots()
-    ax1.plot(df_results["time_h"], df_results["wound_confluence_pct"], marker="o")
-    ax1.set_xlabel("Time (h)")
-    ax1.set_ylabel("Wound Confluence (%)")
-    ax1.set_title("Wound Confluence Over Time")
-    ax1.set_ylim(0, 110)
-    st.pyplot(fig1)
-
-    fig2, ax2 = plt.subplots()
-    ax2.plot(df_results["time_h"], df_results["relative_wound_density_pct"], marker="o")
-    ax2.set_xlabel("Time (h)")
-    ax2.set_ylabel("Relative Wound Density (%)")
-    ax2.set_title("Relative Wound Density Over Time")
-    ax2.set_ylim(0, 200)
-    st.pyplot(fig2)
-
-    st.subheader("Step 4. QC Overlays Across Time")
-    st.markdown(
-        "Each frame: green=cells the algorithm found, red=original wound ROI from T0, yellow=border ring."
-    )
-    for t_hr, name, ov in qc_overlays:
-        st.image(
-            ov,
-            caption=f"{name} @ {t_hr}h",
-            use_column_width=True,
-        )
-
 else:
-    st.info("Upload images and click 'Run Analysis' to begin.")
+    st.info("Upload a full time series for one condition to get started.")
